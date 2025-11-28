@@ -1,0 +1,38 @@
+[
+  {
+    "behavior": {
+      "name": "behavior_verify_geometric_formula",
+      "instruction": "When using a geometric formula (e.g., area or volume), explicitly restate the formula and confirm that it matches the figure and the given quantity (radius vs. diameter, height vs. slant height, etc.) before substituting numbers."
+    },
+    "source_question": "A circle has radius 4. What is its area?",
+    "source_solution": "Reasoning:\nThe area \\(A\\) of a circle is given by the formula \\( A = \\pi r^2 \\), where \\(r\\) is the radius of the circle. Given that the radius \\(r = 4\\), we substitute this value into the formula:\n\n\\[\nA = \\pi \\times 4^2 = \\pi \\times 16 = 16\\pi\n\\]\n\nTherefore, the area of the circle is \\(16\\pi\\).\n\nFinal answer:\n16\\pi",
+    "created_at": "2025-11-28T21:11:03.306696Z"
+  },
+  {
+    "behavior": {
+      "name": "behavior_consider_units_for_areas",
+      "instruction": "After computing an area, check whether the problem specifies units; if so, ensure the final answer is expressed in square units (e.g., cm², m²) and that this is stated clearly in the conclusion."
+    },
+    "source_question": "A circle has radius 4. What is its area?",
+    "source_solution": "Reasoning:\nThe area \\(A\\) of a circle is given by the formula \\( A = \\pi r^2 \\), where \\(r\\) is the radius of the circle. Given that the radius \\(r = 4\\), we substitute this value into the formula:\n\n\\[\nA = \\pi \\times 4^2 = \\pi \\times 16 = 16\\pi\n\\]\n\nTherefore, the area of the circle is \\(16\\pi\\).\n\nFinal answer:\n16\\pi",
+    "created_at": "2025-11-28T21:11:03.306699Z"
+  },
+  {
+    "behavior": {
+      "name": "behavior_use_complement_for_probability_checks",
+      "instruction": "When computing a probability in a finite sample space, especially with dice, cards, or coins, consider whether the complement event is simpler to count. After obtaining the desired probability directly, quickly recompute it via the complement (or vice versa) as a consistency check. Apply this particularly when the event is expressed as 'at least', 'at most', or 'not something', to reduce counting mistakes and to validate the result."
+    },
+    "source_question": "A fair six-sided die is rolled twice. What is the probability that the sum of the two rolls is at least 10?",
+    "source_solution": "Reasoning:\nWhen rolling two fair six-sided dice, there are a total of 6 * 6 = 36 possible outcomes.\n\nWe want the probability that the sum of the two rolls is at least 10. The sums that are at least 10 are 10, 11, and 12.\n\n- Sum = 10: Possible pairs are (4,6), (5,5), (6,4). Number of outcomes = 3\n- Sum = 11: Possible pairs are (5,6), (6,5). Number of outcomes = 2\n- Sum = 12: Possible pair is (6,6). Number of outcomes = 1\n\nTotal favorable outcomes = 3 + 2 + 1 = 6.\n\nTherefore, the probability = number of favorable outcomes / total outcomes = 6 / 36 = 1/6.\n\nFinal answer:\n\\(\\frac{1}{6}\\)",
+    "created_at": "2025-11-28T21:11:33.518573Z"
+  },
+  {
+    "behavior": {
+      "name": "behavior_enumerate_outcomes_systematically",
+      "instruction": "For problems involving counting discrete outcomes (such as sums of dice rolls), use a systematic enumeration method: list outcomes in a grid, table, or by fixing one variable and varying the other. Ensure you follow a clear pattern (e.g., fix the first die and list all possibilities for the second) to avoid missing or double-counting outcomes. Use this structured enumeration whenever you need to list all small-case outcomes or verify combinatorial counts."
+    },
+    "source_question": "A fair six-sided die is rolled twice. What is the probability that the sum of the two rolls is at least 10?",
+    "source_solution": "Reasoning:\nWhen rolling two fair six-sided dice, there are a total of 6 * 6 = 36 possible outcomes.\n\nWe want the probability that the sum of the two rolls is at least 10. The sums that are at least 10 are 10, 11, and 12.\n\n- Sum = 10: Possible pairs are (4,6), (5,5), (6,4). Number of outcomes = 3\n- Sum = 11: Possible pairs are (5,6), (6,5). Number of outcomes = 2\n- Sum = 12: Possible pair is (6,6). Number of outcomes = 1\n\nTotal favorable outcomes = 3 + 2 + 1 = 6.\n\nTherefore, the probability = number of favorable outcomes / total outcomes = 6 / 36 = 1/6.\n\nFinal answer:\n\\(\\frac{1}{6}\\)",
+    "created_at": "2025-11-28T21:11:33.518579Z"
+  }
+]

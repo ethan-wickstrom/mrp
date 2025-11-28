@@ -1,0 +1,18 @@
+[project]
+name = "mrp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [{ name = "ethan-wickstrom", email = "e.t.wickstrom@wustl.edu" }]
+requires-python = ">=3.13"
+dependencies = [
+    "dspy-ai>=3.0.4",
+    "scipy>=1.16.3",
+]
+
+[project.scripts]
+mrp = "mrp:main"
+
+[build-system]
+requires = ["uv_build>=0.9.5,<0.10.0"]
+build-backend = "uv_build"
