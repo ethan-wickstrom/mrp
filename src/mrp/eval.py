@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import math
 import random
 import re
 from statistics import mean, stdev
-from typing import Iterable, List
+from typing import Iterable, Sequence
 
 import dspy
 from scipy import stats
@@ -144,7 +145,9 @@ def _parse_numeric(text: str) -> float | None:
     if pi_match:
         return float(pi_match.group(1)) * math.pi
 
-    fraction_match = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)/([+-]?\d+(?:\.\d+)?)", normalized)
+    fraction_match = re.fullmatch(
+        r"([+-]?\d+(?:\.\d+)?)/([+-]?\d+(?:\.\d+)?)", normalized
+    )
     if fraction_match:
         numerator = float(fraction_match.group(1))
         denominator = float(fraction_match.group(2))
@@ -197,7 +200,9 @@ def _sum_usage_tokens(history: Iterable[dict]) -> int:
     return total
 
 
-def _build_pipeline(with_store: bool, shared_store: InMemoryBehaviorStore | None) -> MRP:
+def _build_pipeline(
+    with_store: bool, shared_store: InMemoryBehaviorStore | None
+) -> MRP:
     solve_lm = dspy.LM("openai/gpt-4.1-mini", cache=False)
     behave_lm = dspy.LM("openai/gpt-4.1-mini", cache=False)
     reflection_lm = dspy.LM(
@@ -220,7 +225,23 @@ def _build_pipeline(with_store: bool, shared_store: InMemoryBehaviorStore | None
     )
 
 
-def _run_example(
+def _prepare_shuffles(
+    examples: Sequence[EvalExample],
+    repetitions: int,
+    seed: int,
+) -> list[list[EvalExample]]:
+    rng = random.Random(seed)
+    shuffles: list[list[EvalExample]] = []
+
+    for _ in range(repetitions):
+        shuffled = list(examples)
+        rng.shuffle(shuffled)
+        shuffles.append(shuffled)
+
+    return shuffles
+
+
+async def _run_example_async(
     example: EvalExample,
     with_store: bool,
     shared_store: InMemoryBehaviorStore | None,
@@ -229,52 +250,91 @@ def _run_example(
     behave_lm = pipeline.behave_lm
     behave_lm.history.clear()
 
-    result = pipeline(
-        initial_question=example.initial_question,
-        new_question=example.new_question,
-        existing_behaviors=None,
-    )
+    async_pipeline = dspy.asyncify(pipeline)
+
+    # TODO: Remove type: ignore once dspy.asyncify is properly typed in the library
+    #
+    # The lint error occurs because `dspy.asyncify(pipeline)` returns a generic
+    # async callable. The static type checker (Pyright) doesn't know the wrapped
+    # function's signature, it sees something like `Callable[..., Coroutine]` with
+    # no typed parameters. When you call it with keyword arguments, the checker
+    # complains it doesn't recognize those parameter names.
+    result = await async_pipeline(  # type: ignore
+        initial_question=example.initial_question,  # type: ignore
+        new_question=example.new_question,  # type: ignore
+        existing_behaviors=None,  # type: ignore
+    )  # type: ignore
 
     tokens_step4 = _sum_usage_tokens(behave_lm.history)
     is_correct = bool(accuracy_metric(example, result))
     return ConditionOutcome(tokens_step4=tokens_step4, correct=is_correct)
 
 
-def evaluate_repetitions(
-    examples: List[EvalExample],
+async def _evaluate_single_repetition(
+    repetition: int,
+    examples: Sequence[EvalExample],
+) -> list[Observation]:
+    persistent_store = InMemoryBehaviorStore()
+    observations: list[Observation] = []
+
+    for example in examples:
+        outcome_a, outcome_b = await asyncio.gather(
+            _run_example_async(example, with_store=False, shared_store=None),
+            _run_example_async(
+                example,
+                with_store=True,
+                shared_store=persistent_store,
+            ),
+        )
+
+        observations.append(
+            Observation(
+                repetition=repetition,
+                example_name=example.name,
+                tokens_a=outcome_a.tokens_step4,
+                tokens_b=outcome_b.tokens_step4,
+                correct_a=outcome_a.correct,
+                correct_b=outcome_b.correct,
+            )
+        )
+
+    return observations
+
+
+async def evaluate_repetitions_async(
+    examples: Sequence[EvalExample],
     repetitions: int,
     seed: int,
 ) -> list[Observation]:
     dspy.configure(track_usage=True)
-    rng = random.Random(seed)
+    shuffled_runs = _prepare_shuffles(examples, repetitions, seed)
+
+    repetition_tasks = [
+        asyncio.create_task(_evaluate_single_repetition(rep_idx, run_examples))
+        for rep_idx, run_examples in enumerate(shuffled_runs)
+    ]
+
+    completed = await asyncio.gather(*repetition_tasks)
 
     observations: list[Observation] = []
-
-    for repetition in range(repetitions):
-        shuffled = list(examples)
-        rng.shuffle(shuffled)
-        persistent_store = InMemoryBehaviorStore()
-
-        for example in shuffled:
-            outcome_a = _run_example(example, with_store=False, shared_store=None)
-            outcome_b = _run_example(
-                example,
-                with_store=True,
-                shared_store=persistent_store,
-            )
-
-            observations.append(
-                Observation(
-                    repetition=repetition,
-                    example_name=example.name,
-                    tokens_a=outcome_a.tokens_step4,
-                    tokens_b=outcome_b.tokens_step4,
-                    correct_a=outcome_a.correct,
-                    correct_b=outcome_b.correct,
-                )
-            )
+    for rep_observations in completed:
+        observations.extend(rep_observations)
 
     return observations
+
+
+def evaluate_repetitions(
+    examples: Sequence[EvalExample],
+    repetitions: int,
+    seed: int,
+) -> list[Observation]:
+    return asyncio.run(
+        evaluate_repetitions_async(
+            examples=examples,
+            repetitions=repetitions,
+            seed=seed,
+        )
+    )
 
 
 def summarize(
@@ -295,7 +355,7 @@ def summarize(
     reduction_pct = ((mean_tokens_a - mean_tokens_b) / mean_tokens_a) * 100.0
 
     ttest_result = stats.ttest_rel(tokens_a, tokens_b, alternative=alternative)
-    ci = ttest_result.confidence_interval(confidence_level=0.95, alternative=alternative)
+    ci = ttest_result.confidence_interval(confidence_level=1.0 - alpha)
     significant = ttest_result.pvalue < alpha
 
     print("\nPer-observation results (Step 4 only):")
@@ -327,19 +387,22 @@ def summarize(
         f"paired_t_test (alternative={alternative}): "
         f"t={ttest_result.statistic:.4f}, p={ttest_result.pvalue:.4g}, df={ttest_result.df}"
     )
-    print(
-        "95% CI for mean delta: "
-        f"[{ci.low:.2f}, {ci.high:.2f}]"
-    )
+    print(f"{100 * (1 - alpha):.0f}% CI for mean delta: [{ci.low:.2f}, {ci.high:.2f}]")
     print(f"significant_at_alpha_{alpha}: {significant}")
 
 
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Evaluate metacognitive reuse token effects.")
-    parser.add_argument("--repetitions", type=int, default=5, help="Number of shuffled runs to perform.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for shuffling.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate metacognitive reuse token effects."
+    )
+    parser.add_argument(
+        "--repetitions", type=int, default=5, help="Number of shuffled runs to perform."
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for shuffling."
+    )
     parser.add_argument(
         "--alternative",
         choices=["two-sided", "greater", "less"],
@@ -349,7 +412,9 @@ def main() -> None:
     args = parser.parse_args()
 
     examples = default_dataset()
-    observations = evaluate_repetitions(examples, repetitions=args.repetitions, seed=args.seed)
+    observations = evaluate_repetitions(
+        examples, repetitions=args.repetitions, seed=args.seed
+    )
     summarize(observations, repetitions=args.repetitions, alternative=args.alternative)
 
 
