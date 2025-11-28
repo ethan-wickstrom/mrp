@@ -1,18 +1,36 @@
+"""Evaluation harness for the MRP pipeline using functional programming patterns.
+
+This module uses declarative, side-effect-minimizing constructs:
+- Pure functions that transform data without external mutation
+- Result types for error handling instead of try/catch with continue
+- itertools/functools for data transformations
+- Closure-based dependency injection instead of global mutable state
+"""
+
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import reduce
+import itertools
 import math
 import random
 import re
+import sys
 from statistics import mean, stdev
-from typing import Iterable, Sequence
+from typing import Awaitable, Iterable, Sequence
 
 import dspy
 from scipy import stats
 
 from mrp.pipeline import MRP
 from mrp.store import InMemoryBehaviorStore
+
+
+# ---------------------------------------------------------------------------
+# Data Types (immutable, frozen dataclasses)
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -25,18 +43,41 @@ class EvalExample:
 
 @dataclass(frozen=True)
 class ConditionOutcome:
+    """Result of running a single condition (with or without store)."""
+
     tokens_step4: int
     correct: bool
 
 
 @dataclass(frozen=True)
 class Observation:
+    """Paired observation comparing both conditions for a single example."""
+
     repetition: int
     example_name: str
     tokens_a: int
     tokens_b: int
     correct_a: bool
     correct_b: bool
+
+
+@dataclass(frozen=True)
+class Success:
+    """Successful evaluation result containing an Observation."""
+
+    value: Observation
+
+
+@dataclass(frozen=True)
+class Failure:
+    """Failed evaluation with error context."""
+
+    example_name: str
+    error: str
+
+
+# Result type: either Success or Failure (sum type / tagged union)
+type EvalResult = Success | Failure
 
 
 def default_dataset() -> list[EvalExample]:
@@ -135,74 +176,98 @@ def default_dataset() -> list[EvalExample]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Pure Functions (no side effects, output depends only on input)
+# ---------------------------------------------------------------------------
+
+
 def _strip_text(value: str) -> str:
+    """Remove whitespace and lowercase a string."""
     return re.sub(r"\s+", "", value).lower()
 
 
 def _parse_numeric(text: str) -> float | None:
+    """Extract a numeric value from text, handling pi expressions, fractions, and decimals.
+
+    Searches for patterns anywhere in the text (not just exact matches) to handle
+    model outputs like "The answer is 5/54" or "Area = 49*pi".
+    Priority: pi expressions > fractions > plain decimals.
+    """
     normalized = _strip_text(text).replace(",", "").replace("π", "pi")
-    pi_match = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)\*?pi", normalized)
-    if pi_match:
+
+    # Search for pi expressions anywhere (e.g., "49*pi", "49pi")
+    if pi_match := re.search(r"([+-]?\d+(?:\.\d+)?)\*?pi", normalized):
         return float(pi_match.group(1)) * math.pi
 
-    fraction_match = re.fullmatch(
+    # Search for fractions anywhere (e.g., "5/54", "11/16")
+    if fraction_match := re.search(
         r"([+-]?\d+(?:\.\d+)?)/([+-]?\d+(?:\.\d+)?)", normalized
-    )
-    if fraction_match:
-        numerator = float(fraction_match.group(1))
-        denominator = float(fraction_match.group(2))
-        if denominator != 0.0:
-            return numerator / denominator
-        return None
+    ):
+        numerator, denominator = (
+            float(fraction_match.group(1)),
+            float(fraction_match.group(2)),
+        )
+        return numerator / denominator if denominator != 0.0 else None
 
-    decimal_match = re.fullmatch(r"[+-]?\d+(?:\.\d+)?", normalized)
-    if decimal_match:
+    # Search for plain decimals (e.g., "96", "8.5")
+    if decimal_match := re.search(r"[+-]?\d+(?:\.\d+)?", normalized):
         return float(decimal_match.group(0))
 
-    number_in_text = re.search(r"[+-]?\d+(?:\.\d+)?", normalized)
-    if number_in_text is not None:
-        return float(number_in_text.group(0))
-
     return None
+
+
+def _extract_tokens_from_entry(entry: dict) -> int:
+    """Extract token count from a single history entry (pure function)."""
+    usage = entry.get("usage")
+    if usage is None:
+        return 0
+    if "total_tokens" in usage:
+        return int(usage["total_tokens"])
+    return int(usage.get("prompt_tokens", 0)) + int(usage.get("completion_tokens", 0))
+
+
+def _sum_usage_tokens(history: Iterable[dict]) -> int:
+    """Sum token usage across history entries using functional reduce."""
+    return reduce(
+        lambda acc, entry: acc + _extract_tokens_from_entry(entry), history, 0
+    )
 
 
 def accuracy_metric(
     example: EvalExample,
     pred: dspy.Prediction,
-    trace=None,
+    trace: object = None,
 ) -> float:
-    predicted_answer = pred.behaved_solution.solution
+    """Compute accuracy (1.0 or 0.0) by comparing predicted vs expected answer."""
+    predicted_answer: str = pred.behaved_solution.solution
     predicted_value = _parse_numeric(predicted_answer)
     expected_value = _parse_numeric(example.expected_answer)
 
+    # Numeric comparison with tolerance
     if predicted_value is not None and expected_value is not None:
-        if math.isclose(predicted_value, expected_value, rel_tol=1e-3, abs_tol=1e-3):
-            return 1.0
-        return 0.0
+        return (
+            1.0
+            if math.isclose(predicted_value, expected_value, rel_tol=1e-3, abs_tol=1e-3)
+            else 0.0
+        )
 
-    predicted_text = _strip_text(predicted_answer)
-    expected_text = _strip_text(example.expected_answer)
-    return 1.0 if predicted_text == expected_text else 0.0
+    # Fallback to exact text match
+    return (
+        1.0
+        if _strip_text(predicted_answer) == _strip_text(example.expected_answer)
+        else 0.0
+    )
 
 
-def _sum_usage_tokens(history: Iterable[dict]) -> int:
-    total = 0
-    for entry in history:
-        usage = entry.get("usage")
-        if usage is None:
-            continue
-        if "total_tokens" in usage:
-            total += int(usage["total_tokens"])
-            continue
-        prompt = int(usage.get("prompt_tokens", 0))
-        completion = int(usage.get("completion_tokens", 0))
-        total += prompt + completion
-    return total
+# ---------------------------------------------------------------------------
+# Pipeline Construction (factory functions)
+# ---------------------------------------------------------------------------
 
 
 def _build_pipeline(
     with_store: bool, shared_store: InMemoryBehaviorStore | None
 ) -> MRP:
+    """Construct an MRP pipeline with the specified store configuration."""
     solve_lm = dspy.LM("openai/gpt-4.1-mini", cache=False)
     behave_lm = dspy.LM("openai/gpt-4.1-mini", cache=False)
     reflection_lm = dspy.LM(
@@ -212,17 +277,23 @@ def _build_pipeline(
         reasoning_effort="high",
         cache=False,
     )
-
-    behavior_store = shared_store if with_store else None
-
     return MRP(
         solve_lm=solve_lm,
         reflection_lm=reflection_lm,
         behavior_lm=reflection_lm,
         behave_lm=behave_lm,
-        behavior_store=behavior_store,
+        behavior_store=shared_store if with_store else None,
         max_behaviors_for_step4=8,
     )
+
+
+def _shuffle_copy(
+    examples: Sequence[EvalExample], rng: random.Random
+) -> list[EvalExample]:
+    """Create a shuffled copy of examples (pure aside from RNG state)."""
+    shuffled = list(examples)
+    rng.shuffle(shuffled)
+    return shuffled
 
 
 def _prepare_shuffles(
@@ -230,97 +301,178 @@ def _prepare_shuffles(
     repetitions: int,
     seed: int,
 ) -> list[list[EvalExample]]:
+    """Generate shuffled example orderings for each repetition.
+
+    Uses a seeded RNG for reproducibility. Expressed as a list comprehension
+    over range(repetitions) with a helper function for the shuffle operation.
+    """
     rng = random.Random(seed)
-    shuffles: list[list[EvalExample]] = []
-
-    for _ in range(repetitions):
-        shuffled = list(examples)
-        rng.shuffle(shuffled)
-        shuffles.append(shuffled)
-
-    return shuffles
+    return [_shuffle_copy(examples, rng) for _ in range(repetitions)]
 
 
-async def _run_example_async(
+# ---------------------------------------------------------------------------
+# Async Evaluation (functional patterns with dependency injection)
+# ---------------------------------------------------------------------------
+
+
+# Type alias for the example runner function signature
+type ExampleRunner = Callable[
+    [EvalExample, bool, InMemoryBehaviorStore | None],
+    Awaitable[ConditionOutcome],
+]
+
+
+def _make_example_runner(semaphore: asyncio.Semaphore) -> ExampleRunner:
+    """Factory that creates an example runner with injected semaphore (closure pattern).
+
+    This eliminates global mutable state by capturing the semaphore in a closure.
+    The returned async function is pure in its data flow (inputs -> outputs).
+    """
+
+    async def run_example(
+        example: EvalExample,
+        with_store: bool,
+        shared_store: InMemoryBehaviorStore | None,
+    ) -> ConditionOutcome:
+        pipeline = _build_pipeline(with_store=with_store, shared_store=shared_store)
+        behave_lm = pipeline.behave_lm
+        behave_lm.history.clear()
+
+        async with semaphore:
+            result = await pipeline.acall(
+                initial_question=example.initial_question,
+                new_question=example.new_question,
+                existing_behaviors=None,
+            )
+
+        return ConditionOutcome(
+            tokens_step4=_sum_usage_tokens(behave_lm.history),
+            correct=bool(accuracy_metric(example, result)),
+        )
+
+    return run_example
+
+
+def _outcomes_to_observation(
+    repetition: int,
     example: EvalExample,
-    with_store: bool,
-    shared_store: InMemoryBehaviorStore | None,
-) -> ConditionOutcome:
-    pipeline = _build_pipeline(with_store=with_store, shared_store=shared_store)
-    behave_lm = pipeline.behave_lm
-    behave_lm.history.clear()
+    outcome_a: ConditionOutcome,
+    outcome_b: ConditionOutcome,
+) -> Observation:
+    """Pure function to combine outcomes into an Observation."""
+    return Observation(
+        repetition=repetition,
+        example_name=example.name,
+        tokens_a=outcome_a.tokens_step4,
+        tokens_b=outcome_b.tokens_step4,
+        correct_a=outcome_a.correct,
+        correct_b=outcome_b.correct,
+    )
 
-    async_pipeline = dspy.asyncify(pipeline)
 
-    # TODO: Remove type: ignore once dspy.asyncify is properly typed in the library
-    #
-    # The lint error occurs because `dspy.asyncify(pipeline)` returns a generic
-    # async callable. The static type checker (Pyright) doesn't know the wrapped
-    # function's signature, it sees something like `Callable[..., Coroutine]` with
-    # no typed parameters. When you call it with keyword arguments, the checker
-    # complains it doesn't recognize those parameter names.
-    result = await async_pipeline(  # type: ignore
-        initial_question=example.initial_question,  # type: ignore
-        new_question=example.new_question,  # type: ignore
-        existing_behaviors=None,  # type: ignore
-    )  # type: ignore
+async def _evaluate_example_pair(
+    run_example: ExampleRunner,
+    repetition: int,
+    example: EvalExample,
+    store: InMemoryBehaviorStore,
+) -> EvalResult:
+    """Evaluate a single example under both conditions, returning Success or Failure.
 
-    tokens_step4 = _sum_usage_tokens(behave_lm.history)
-    is_correct = bool(accuracy_metric(example, result))
-    return ConditionOutcome(tokens_step4=tokens_step4, correct=is_correct)
+    Uses Result type pattern for functional error handling instead of try/catch with continue.
+    """
+    try:
+        # Positional args required for Callable type compatibility
+        outcome_a, outcome_b = await asyncio.gather(
+            run_example(example, False, None),  # without store
+            run_example(example, True, store),  # with store
+        )
+        return Success(
+            _outcomes_to_observation(repetition, example, outcome_a, outcome_b)
+        )
+    except Exception as e:
+        return Failure(example_name=example.name, error=str(e))
 
 
 async def _evaluate_single_repetition(
+    run_example: ExampleRunner,
     repetition: int,
     examples: Sequence[EvalExample],
-) -> list[Observation]:
-    persistent_store = InMemoryBehaviorStore()
-    observations: list[Observation] = []
+    verbose: bool = True,
+) -> list[EvalResult]:
+    """Evaluate all examples in a repetition sequentially (store accumulates).
 
-    for example in examples:
-        outcome_a, outcome_b = await asyncio.gather(
-            _run_example_async(example, with_store=False, shared_store=None),
-            _run_example_async(
-                example,
-                with_store=True,
-                shared_store=persistent_store,
-            ),
-        )
+    Returns a list of EvalResult (Success | Failure) for functional filtering downstream.
+    Sequential processing is required because the behavior store accumulates across examples.
+    """
+    store = InMemoryBehaviorStore()
+    total = len(examples)
 
-        observations.append(
-            Observation(
-                repetition=repetition,
-                example_name=example.name,
-                tokens_a=outcome_a.tokens_step4,
-                tokens_b=outcome_b.tokens_step4,
-                correct_a=outcome_a.correct,
-                correct_b=outcome_b.correct,
+    async def evaluate_with_progress(idx: int, example: EvalExample) -> EvalResult:
+        result = await _evaluate_example_pair(run_example, repetition, example, store)
+        if verbose:
+            status = "✓" if isinstance(result, Success) else "✗"
+            print(
+                f"[rep {repetition}] {idx + 1}/{total} {example.name} {status}",
+                file=sys.stderr,
             )
-        )
+        return result
 
-    return observations
+    # Sequential evaluation (store must accumulate) expressed as async comprehension
+    return [await evaluate_with_progress(idx, ex) for idx, ex in enumerate(examples)]
+
+
+def _extract_successes(results: Iterable[EvalResult]) -> list[Observation]:
+    """Filter successful results and extract observations (pure function)."""
+    return [r.value for r in results if isinstance(r, Success)]
+
+
+def _log_failures(results: Iterable[EvalResult], repetition: int) -> None:
+    """Log failed evaluations to stderr (isolated side effect)."""
+    for r in results:
+        if isinstance(r, Failure):
+            print(
+                f"[rep {repetition}] Error on {r.example_name}: {r.error}",
+                file=sys.stderr,
+            )
 
 
 async def evaluate_repetitions_async(
     examples: Sequence[EvalExample],
     repetitions: int,
     seed: int,
+    max_concurrent: int = 10,
 ) -> list[Observation]:
+    """Run evaluation across multiple repetitions with functional orchestration.
+
+    - Semaphore is created once and injected via closure (no global state)
+    - Repetitions run in parallel via asyncio.gather
+    - Results flattened via itertools.chain.from_iterable
+    - Failures filtered out functionally
+    """
     dspy.configure(track_usage=True)
+
+    # Inject semaphore via factory (eliminates global mutable state)
+    semaphore = asyncio.Semaphore(max_concurrent)
+    run_example = _make_example_runner(semaphore)
+
     shuffled_runs = _prepare_shuffles(examples, repetitions, seed)
 
-    repetition_tasks = [
-        asyncio.create_task(_evaluate_single_repetition(rep_idx, run_examples))
-        for rep_idx, run_examples in enumerate(shuffled_runs)
-    ]
+    # Parallel repetition evaluation (each repetition is independent)
+    gathered = await asyncio.gather(
+        *[
+            _evaluate_single_repetition(run_example, rep_idx, run_examples)
+            for rep_idx, run_examples in enumerate(shuffled_runs)
+        ]
+    )
+    all_results: list[list[EvalResult]] = list(gathered)
 
-    completed = await asyncio.gather(*repetition_tasks)
+    # Log failures for each repetition (isolated side effect)
+    for rep_idx, results in enumerate(all_results):
+        _log_failures(results, rep_idx)
 
-    observations: list[Observation] = []
-    for rep_observations in completed:
-        observations.extend(rep_observations)
-
-    return observations
+    # Flatten results and extract successes using itertools.chain.from_iterable
+    flattened_results = itertools.chain.from_iterable(all_results)
+    return _extract_successes(flattened_results)
 
 
 def evaluate_repetitions(
@@ -328,6 +480,7 @@ def evaluate_repetitions(
     repetitions: int,
     seed: int,
 ) -> list[Observation]:
+    """Synchronous entry point that delegates to async implementation."""
     return asyncio.run(
         evaluate_repetitions_async(
             examples=examples,
@@ -337,58 +490,103 @@ def evaluate_repetitions(
     )
 
 
-def summarize(
-    observations: list[Observation],
-    repetitions: int,
+# ---------------------------------------------------------------------------
+# Reporting (functional data extraction + isolated print side effect)
+# ---------------------------------------------------------------------------
+
+
+def _format_observation_csv(obs: Observation) -> str:
+    """Format a single observation as CSV row (pure function)."""
+    return (
+        f"{obs.repetition},{obs.example_name},{obs.tokens_a},{obs.tokens_b},"
+        f"{int(obs.correct_a)},{int(obs.correct_b)}"
+    )
+
+
+def _compute_summary_stats(
+    observations: Sequence[Observation],
     alternative: str,
-    alpha: float = 0.05,
-) -> None:
+    alpha: float,
+) -> dict[str, float | bool | str]:
+    """Compute all summary statistics from observations (pure function).
+
+    Returns a dictionary of computed values for downstream formatting.
+    """
+    # Extract data series using comprehensions (functional transformation)
     tokens_a = [float(obs.tokens_a) for obs in observations]
     tokens_b = [float(obs.tokens_b) for obs in observations]
-    token_deltas = [a - b for a, b in zip(tokens_a, tokens_b)]
-
+    token_deltas = [a - b for a, b in zip(tokens_a, tokens_b, strict=True)]
     acc_a = [1.0 if obs.correct_a else 0.0 for obs in observations]
     acc_b = [1.0 if obs.correct_b else 0.0 for obs in observations]
 
+    # Compute aggregate statistics
     mean_tokens_a = mean(tokens_a)
     mean_tokens_b = mean(tokens_b)
     reduction_pct = ((mean_tokens_a - mean_tokens_b) / mean_tokens_a) * 100.0
 
     ttest_result = stats.ttest_rel(tokens_a, tokens_b, alternative=alternative)
     ci = ttest_result.confidence_interval(confidence_level=1.0 - alpha)
-    significant = ttest_result.pvalue < alpha
 
-    print("\nPer-observation results (Step 4 only):")
-    print(
+    return {
+        "mean_tokens_a": mean_tokens_a,
+        "mean_tokens_b": mean_tokens_b,
+        "reduction_pct": reduction_pct,
+        "accuracy_a": mean(acc_a),
+        "accuracy_b": mean(acc_b),
+        "mean_delta": mean(token_deltas),
+        "std_delta": stdev(token_deltas),
+        "t_stat": ttest_result.statistic,
+        "p_value": ttest_result.pvalue,
+        "df": ttest_result.df,
+        "ci_low": ci.low,
+        "ci_high": ci.high,
+        "significant": ttest_result.pvalue < alpha,
+        "alternative": alternative,
+        "alpha": alpha,
+    }
+
+
+def summarize(
+    observations: list[Observation],
+    repetitions: int,
+    alternative: str,
+    alpha: float = 0.05,
+) -> None:
+    """Print evaluation summary (isolated side effect with pure data computation).
+
+    Data extraction and statistics computation are pure functions.
+    Only the final print statements produce side effects.
+    """
+    stats_dict = _compute_summary_stats(observations, alternative, alpha)
+
+    # Generate CSV rows using generator expression (functional)
+    csv_header = (
         "repetition,example,tokens_no_store,tokens_with_store,"
         "correct_no_store,correct_with_store"
     )
-    for obs in observations:
-        print(
-            f"{obs.repetition},"
-            f"{obs.example_name},"
-            f"{obs.tokens_a},"
-            f"{obs.tokens_b},"
-            f"{int(obs.correct_a)},"
-            f"{int(obs.correct_b)}"
-        )
+    csv_rows = "\n".join(_format_observation_csv(obs) for obs in observations)
 
+    # Isolated side effect: print output
+    print(f"\nPer-observation results (Step 4 only):\n{csv_header}\n{csv_rows}")
     print("\nAggregate across repetitions:")
     print(f"repetitions: {repetitions}")
     print(f"observations: {len(observations)}")
-    print(f"mean_tokens_no_store: {mean_tokens_a:.2f}")
-    print(f"mean_tokens_with_store: {mean_tokens_b:.2f}")
-    print(f"token_reduction_pct: {reduction_pct:.2f}%")
-    print(f"accuracy_no_store: {mean(acc_a):.2f}")
-    print(f"accuracy_with_store: {mean(acc_b):.2f}")
-    print(f"mean_delta_tokens: {mean(token_deltas):.2f}")
-    print(f"std_delta_tokens: {stdev(token_deltas):.2f}")
+    print(f"mean_tokens_no_store: {stats_dict['mean_tokens_a']:.2f}")
+    print(f"mean_tokens_with_store: {stats_dict['mean_tokens_b']:.2f}")
+    print(f"token_reduction_pct: {stats_dict['reduction_pct']:.2f}%")
+    print(f"accuracy_no_store: {stats_dict['accuracy_a']:.2f}")
+    print(f"accuracy_with_store: {stats_dict['accuracy_b']:.2f}")
+    print(f"mean_delta_tokens: {stats_dict['mean_delta']:.2f}")
+    print(f"std_delta_tokens: {stats_dict['std_delta']:.2f}")
     print(
-        f"paired_t_test (alternative={alternative}): "
-        f"t={ttest_result.statistic:.4f}, p={ttest_result.pvalue:.4g}, df={ttest_result.df}"
+        f"paired_t_test (alternative={stats_dict['alternative']}): "
+        f"t={stats_dict['t_stat']:.4f}, p={stats_dict['p_value']:.4g}, df={stats_dict['df']}"
     )
-    print(f"{100 * (1 - alpha):.0f}% CI for mean delta: [{ci.low:.2f}, {ci.high:.2f}]")
-    print(f"significant_at_alpha_{alpha}: {significant}")
+    print(
+        f"{100 * (1 - float(stats_dict['alpha'])):.0f}% CI for mean delta: "
+        f"[{stats_dict['ci_low']:.2f}, {stats_dict['ci_high']:.2f}]"
+    )
+    print(f"significant_at_alpha_{stats_dict['alpha']}: {stats_dict['significant']}")
 
 
 def main() -> None:
