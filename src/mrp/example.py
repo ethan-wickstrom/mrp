@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -41,11 +42,31 @@ def build_pipeline_with_store(
     return pipeline, store
 
 
+async def run_one_session_async(
+    store_path: str | Path,
+    initial_question: str,
+    new_question: str,
+) -> None:
+    """Run a single pipeline session using async execution."""
+    pipeline, store = build_pipeline_with_store(store_path)
+
+    print("=== Running pipeline (async) ===")
+    # Use native DSPy async via acall() which invokes aforward() on the pipeline.
+    result = await pipeline.acall(
+        initial_question=initial_question,
+        new_question=new_question,
+        existing_behaviors=None,
+    )
+
+    _print_result(result, store)
+
+
 def run_one_session(
     store_path: str | Path,
     initial_question: str,
     new_question: str,
 ) -> None:
+    """Run a single pipeline session using synchronous execution."""
     pipeline, store = build_pipeline_with_store(store_path)
 
     print("=== Running pipeline ===")
@@ -55,6 +76,11 @@ def run_one_session(
         existing_behaviors=None,
     )
 
+    _print_result(result, store)
+
+
+def _print_result(result: dspy.Prediction, store: JsonFileBehaviorStore) -> None:
+    """Print pipeline results and store state."""
     print("=== STEP 1: Initial Solution ===")
     print(result.initial_solution.reasoning)
     print("Final answer:", result.initial_solution.solution)
@@ -89,9 +115,8 @@ def run_one_session(
     print()
 
 
-def main() -> None:
-    # Ensure the OpenAI API key is set before running. This example relies on
-    # the environment variable, but you can also pass api_key=... to dspy.LM.
+async def main_async() -> None:
+    """Async entry point demonstrating native DSPy async patterns."""
     if "OPENAI_API_KEY" not in os.environ:
         raise RuntimeError(
             "Please set the OPENAI_API_KEY environment variable before running this example."
@@ -102,7 +127,7 @@ def main() -> None:
     # First session: one pair of problems.
     first_initial = "A circle has radius 4. What is its area?"
     first_new = "A circle has radius 7. What is its area?"
-    run_one_session(
+    await run_one_session_async(
         store_path=store_path,
         initial_question=first_initial,
         new_question=first_new,
@@ -117,11 +142,16 @@ def main() -> None:
         "A fair six-sided die is rolled three times. "
         "What is the probability that the sum of the three rolls is at least 15?"
     )
-    run_one_session(
+    await run_one_session_async(
         store_path=store_path,
         initial_question=second_initial,
         new_question=second_new,
     )
+
+
+def main() -> None:
+    """Synchronous entry point (delegates to async main)."""
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
