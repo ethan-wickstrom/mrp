@@ -1,14 +1,46 @@
+"""Four-stage Metacognitive Reuse Pipeline (MRP) for math problem solving.
+
+This module implements the MRP pipeline using DSPy modules:
+1. Solve: Generate initial solution trace with a smaller LM
+2. Reflect: Critique solution and suggest behaviors with a stronger LM
+3. Behaviors: Distill reflection into reusable behavior handbook
+4. Behave: Solve new problem conditioned on the behavior handbook
+
+Design principles:
+- Frozen Pydantic models for immutable data structures
+- Pure functions for data transformations (behavior merging, formatting)
+- DSPy Module classes (required by framework) with strict typing
+- Both sync (forward) and async (aforward) interfaces
+"""
+
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from collections.abc import Sequence
+
+from pydantic import BaseModel, ConfigDict, Field
 
 import dspy
 
 from mrp.store import Behavior, BehaviorRecord, BehaviorStore
 
 
+# ---------------------------------------------------------------------------
+# Type Aliases (Python 3.12+ syntax)
+# ---------------------------------------------------------------------------
+
+type BehaviorMap = dict[str, Behavior]
+type BehaviorList = list[Behavior]
+
+
+# ---------------------------------------------------------------------------
+# Immutable Data Models (frozen Pydantic models)
+# ---------------------------------------------------------------------------
+
+
 class Reflection(BaseModel):
-    """Structured reflection on a math solution."""
+    """Structured reflection on a math solution (immutable)."""
+
+    model_config = ConfigDict(frozen=True)
 
     correctness_analysis: str = Field(
         description=(
@@ -32,7 +64,9 @@ class Reflection(BaseModel):
 
 
 class SolveOutput(BaseModel):
-    """Normalized representation of a model's solution to a math problem."""
+    """Normalized representation of a model's solution to a math problem (immutable)."""
+
+    model_config = ConfigDict(frozen=True)
 
     question: str = Field(description="The math problem that was solved.")
     reasoning: str = Field(
@@ -42,7 +76,9 @@ class SolveOutput(BaseModel):
 
 
 class MetacognitiveReuseResult(BaseModel):
-    """Container for the full four-stage metacognitive reuse pipeline output."""
+    """Container for the full four-stage pipeline output (immutable)."""
+
+    model_config = ConfigDict(frozen=True)
 
     initial_solution: SolveOutput = Field(
         description="Solution produced in Step 1 (Solve)."
@@ -64,9 +100,70 @@ class MetacognitiveReuseResult(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# Pure Functions (data transformations)
+# ---------------------------------------------------------------------------
+
+
 def format_solution_for_reflection(solved: SolveOutput) -> str:
-    """Render a SolveOutput as a single text block for reflection / behavior extraction."""
+    """Render a SolveOutput as a single text block for reflection (pure function)."""
     return f"Reasoning:\n{solved.reasoning}\n\nFinal answer:\n{solved.solution}"
+
+
+def _merge_behaviors(*behavior_sources: Sequence[Behavior]) -> BehaviorList:
+    """Merge multiple behavior sequences, deduplicating by name (pure function).
+
+    Later sources take precedence when names conflict.
+    Uses functional dict comprehension instead of imperative loops.
+    """
+    merged: BehaviorMap = {}
+    for source in behavior_sources:
+        merged = {**merged, **{b.name: b for b in source}}
+    return list(merged.values())
+
+
+def _records_from_behaviors(
+    behaviors: Sequence[Behavior],
+    source_question: str,
+    source_solution: SolveOutput,
+) -> list[BehaviorRecord]:
+    """Wrap plain behaviors in BehaviorRecord objects with provenance (pure function)."""
+    solution_text = format_solution_for_reflection(source_solution)
+    return [
+        BehaviorRecord(
+            behavior=behavior,
+            source_question=source_question,
+            source_solution=solution_text,
+        )
+        for behavior in behaviors
+    ]
+
+
+def _get_behavior_handbook(
+    store: BehaviorStore | None,
+    current_behaviors: BehaviorList,
+    new_question: str,
+    max_behaviors: int | None,
+) -> BehaviorList:
+    """Retrieve behavior handbook from store or use current behaviors (pure function).
+
+    If a store is provided, returns behaviors from the store (optionally limited).
+    Otherwise, returns the current behaviors directly.
+    """
+    if store is None:
+        return current_behaviors
+
+    if max_behaviors is None:
+        stored_records = store.get_all()
+    else:
+        stored_records = store.search(query=new_question, k=max_behaviors)
+
+    return [record.behavior for record in stored_records]
+
+
+# ---------------------------------------------------------------------------
+# DSPy Signatures (declarative input/output specifications)
+# ---------------------------------------------------------------------------
 
 
 class SolveMathProblem(dspy.Signature):
@@ -134,13 +231,27 @@ class BehaveWithBehaviors(dspy.Signature):
     )
 
 
+# ---------------------------------------------------------------------------
+# DSPy Modules (framework-required class-based components)
+# ---------------------------------------------------------------------------
+
+
 class SolveModule(dspy.Module):
-    """STEP 1: Solve – generate an initial solution trace for a math problem."""
+    """STEP 1: Solve - generate an initial solution trace for a math problem."""
 
     def __init__(self) -> None:
         super().__init__()
         # ChainOfThought adds a 'reasoning' field to this signature.
         self._solver = dspy.ChainOfThought(SolveMathProblem)
+
+    async def aforward(self, question: str) -> dspy.Prediction:
+        prediction = await self._solver.acall(question=question)
+        solve_output = SolveOutput(
+            question=question,
+            reasoning=str(prediction.reasoning),
+            solution=str(prediction.solution),
+        )
+        return dspy.Prediction(solve_output=solve_output)
 
     def forward(self, question: str) -> dspy.Prediction:
         prediction = self._solver(question=question)
@@ -153,11 +264,18 @@ class SolveModule(dspy.Module):
 
 
 class ReflectModule(dspy.Module):
-    """STEP 2: Reflect – critique a solution and suggest new behaviors."""
+    """STEP 2: Reflect - critique a solution and suggest new behaviors."""
 
     def __init__(self) -> None:
         super().__init__()
         self._reflect = dspy.ChainOfThought(ReflectOnSolution)
+
+    async def aforward(self, question: str, solved: SolveOutput) -> dspy.Prediction:
+        solution_text = format_solution_for_reflection(solved)
+        prediction = await self._reflect.acall(
+            question=question, solution=solution_text
+        )
+        return dspy.Prediction(reflection=prediction.reflection)
 
     def forward(self, question: str, solved: SolveOutput) -> dspy.Prediction:
         solution_text = format_solution_for_reflection(solved)
@@ -166,12 +284,26 @@ class ReflectModule(dspy.Module):
 
 
 class GenerateBehaviorsModule(dspy.Module):
-    """STEP 3: Generate Behaviors – distill reflection into reusable behaviors."""
+    """STEP 3: Generate Behaviors - distill reflection into reusable behaviors."""
 
     def __init__(self) -> None:
         super().__init__()
         # Behavior extraction is a relatively direct transformation, so Predict suffices.
         self._generator = dspy.Predict(GenerateBehaviorsFromReflection)
+
+    async def aforward(
+        self,
+        question: str,
+        solved: SolveOutput,
+        reflection: Reflection,
+    ) -> dspy.Prediction:
+        solution_text = format_solution_for_reflection(solved)
+        prediction = await self._generator.acall(
+            question=question,
+            solution=solution_text,
+            reflection=reflection,
+        )
+        return dspy.Prediction(behaviors=prediction.behaviors)
 
     def forward(
         self,
@@ -189,11 +321,22 @@ class GenerateBehaviorsModule(dspy.Module):
 
 
 class BehaveModule(dspy.Module):
-    """STEP 4: Behave – behavior-conditioned inference on a new problem."""
+    """STEP 4: Behave - behavior-conditioned inference on a new problem."""
 
     def __init__(self) -> None:
         super().__init__()
         self._behave = dspy.ChainOfThought(BehaveWithBehaviors)
+
+    async def aforward(
+        self, question: str, behaviors: list[Behavior]
+    ) -> dspy.Prediction:
+        prediction = await self._behave.acall(question=question, behaviors=behaviors)
+        solve_output = SolveOutput(
+            question=question,
+            reasoning=str(prediction.reasoning),
+            solution=str(prediction.solution),
+        )
+        return dspy.Prediction(solve_output=solve_output)
 
     def forward(self, question: str, behaviors: list[Behavior]) -> dspy.Prediction:
         prediction = self._behave(question=question, behaviors=behaviors)
@@ -203,6 +346,11 @@ class BehaveModule(dspy.Module):
             solution=str(prediction.solution),
         )
         return dspy.Prediction(solve_output=solve_output)
+
+
+# ---------------------------------------------------------------------------
+# Main Pipeline (orchestrates all stages)
+# ---------------------------------------------------------------------------
 
 
 class MRP(dspy.Module):
@@ -216,6 +364,11 @@ class MRP(dspy.Module):
     4. Behave:     Use a smaller LM to solve a new problem conditioned on the behaviors.
 
     Optionally, a BehaviorStore can be provided to persist behaviors across sessions.
+
+    Design notes:
+    - All data transformations (behavior merging, record creation) use pure functions
+    - Both forward() and aforward() share the same logic via pure function calls
+    - Store operations remain synchronous (fast in-memory or local file I/O)
     """
 
     def __init__(
@@ -240,33 +393,110 @@ class MRP(dspy.Module):
         self.generate_behaviors_module = GenerateBehaviorsModule()
         self.behave_module = BehaveModule()
 
-    def _records_from_behaviors(
+    def _persist_and_get_handbook(
         self,
-        behaviors: list[Behavior],
-        source_question: str,
-        source_solution: SolveOutput,
-    ) -> list[BehaviorRecord]:
-        """Wrap plain behaviors in BehaviorRecord objects with provenance."""
-        solution_text = format_solution_for_reflection(source_solution)
-        return [
-            BehaviorRecord(
-                behavior=behavior,
-                source_question=source_question,
-                source_solution=solution_text,
+        current_behaviors: BehaviorList,
+        initial_question: str,
+        initial_solution: SolveOutput,
+        new_question: str,
+    ) -> BehaviorList:
+        """Persist behaviors to store and retrieve handbook (encapsulated side effect).
+
+        If no store is configured, returns current_behaviors directly.
+        Uses pure functions for record creation and handbook retrieval.
+        """
+        if self.behavior_store is None:
+            return current_behaviors
+
+        # Create records using pure function and persist
+        records = _records_from_behaviors(
+            current_behaviors, initial_question, initial_solution
+        )
+        self.behavior_store.add_many(records)
+
+        # Retrieve handbook using pure function
+        return _get_behavior_handbook(
+            self.behavior_store,
+            current_behaviors,
+            new_question,
+            self.max_behaviors_for_step4,
+        )
+
+    async def aforward(
+        self,
+        initial_question: str,
+        new_question: str,
+        existing_behaviors: BehaviorList | None = None,
+    ) -> dspy.Prediction:
+        """Async version of forward() using native DSPy async patterns.
+
+        All four pipeline stages execute sequentially due to data dependencies:
+        Step 2 requires Step 1's output, Step 3 requires Step 2's, and Step 4 requires Step 3's.
+        Concurrency benefits come from running multiple pipeline instances in parallel.
+        """
+        # STEP 1: Solve with a smaller LM.
+        with dspy.context(lm=self.solve_lm):
+            solve_prediction = await self.solve_module.acall(question=initial_question)
+        initial_solution: SolveOutput = solve_prediction.solve_output
+
+        # STEP 2: Reflect with a stronger LM.
+        with dspy.context(lm=self.reflection_lm):
+            reflection_prediction = await self.reflect_module.acall(
+                question=initial_question,
+                solved=initial_solution,
             )
-            for behavior in behaviors
-        ]
+        reflection: Reflection = reflection_prediction.reflection
+
+        # STEP 3: Generate behaviors with a stronger LM.
+        with dspy.context(lm=self.behavior_lm):
+            behaviors_prediction = await self.generate_behaviors_module.acall(
+                question=initial_question,
+                solved=initial_solution,
+                reflection=reflection,
+            )
+        behaviors_from_example: BehaviorList = behaviors_prediction.behaviors
+
+        # Merge behaviors using pure function (replaces imperative dict building)
+        current_behaviors = _merge_behaviors(
+            reflection.new_behaviors,
+            behaviors_from_example,
+            existing_behaviors or [],
+        )
+
+        # Persist to store and get handbook (encapsulated side effect)
+        behavior_handbook = self._persist_and_get_handbook(
+            current_behaviors, initial_question, initial_solution, new_question
+        )
+
+        # STEP 4: Behave on a new question with the final handbook.
+        with dspy.context(lm=self.behave_lm):
+            behave_prediction = await self.behave_module.acall(
+                question=new_question,
+                behaviors=behavior_handbook,
+            )
+        behaved_solution: SolveOutput = behave_prediction.solve_output
+
+        return dspy.Prediction(
+            initial_solution=initial_solution,
+            reflection=reflection,
+            extracted_behaviors=behavior_handbook,
+            behaved_solution=behaved_solution,
+        )
 
     def forward(
         self,
         initial_question: str,
         new_question: str,
-        existing_behaviors: list[Behavior] | None = None,
+        existing_behaviors: BehaviorList | None = None,
     ) -> dspy.Prediction:
+        """Synchronous forward pass for DSPy optimizer compatibility.
+
+        Uses identical logic to aforward() via shared pure functions.
+        """
         # STEP 1: Solve with a smaller LM.
         with dspy.context(lm=self.solve_lm):
             solve_prediction = self.solve_module(question=initial_question)
-        initial_solution = solve_prediction.solve_output
+        initial_solution: SolveOutput = solve_prediction.solve_output
 
         # STEP 2: Reflect with a stronger LM.
         with dspy.context(lm=self.reflection_lm):
@@ -274,7 +504,7 @@ class MRP(dspy.Module):
                 question=initial_question,
                 solved=initial_solution,
             )
-        reflection = reflection_prediction.reflection
+        reflection: Reflection = reflection_prediction.reflection
 
         # STEP 3: Generate behaviors with a stronger LM.
         with dspy.context(lm=self.behavior_lm):
@@ -283,41 +513,19 @@ class MRP(dspy.Module):
                 solved=initial_solution,
                 reflection=reflection,
             )
-        behaviors_from_example = behaviors_prediction.behaviors
+        behaviors_from_example: BehaviorList = behaviors_prediction.behaviors
 
-        # Merge behaviors from reflection, STEP 3, and any explicit existing behaviors.
-        behavior_by_name: dict[str, Behavior] = {
-            behavior.name: behavior for behavior in reflection.new_behaviors
-        }
-        for behavior in behaviors_from_example:
-            behavior_by_name[behavior.name] = behavior
+        # Merge behaviors using pure function (replaces imperative dict building)
+        current_behaviors = _merge_behaviors(
+            reflection.new_behaviors,
+            behaviors_from_example,
+            existing_behaviors or [],
+        )
 
-        if existing_behaviors is not None:
-            for behavior in existing_behaviors:
-                behavior_by_name[behavior.name] = behavior
-
-        current_behaviors = list(behavior_by_name.values())
-
-        # If a behavior store is configured, persist current behaviors and build
-        # the handbook from the accumulated store contents.
-        if self.behavior_store is not None:
-            records = self._records_from_behaviors(
-                behaviors=current_behaviors,
-                source_question=initial_question,
-                source_solution=initial_solution,
-            )
-            self.behavior_store.add_many(records)
-
-            if self.max_behaviors_for_step4 is None:
-                stored_records = self.behavior_store.get_all()
-            else:
-                stored_records = self.behavior_store.search(
-                    query=new_question,
-                    k=self.max_behaviors_for_step4,
-                )
-            behavior_handbook = [record.behavior for record in stored_records]
-        else:
-            behavior_handbook = current_behaviors
+        # Persist to store and get handbook (encapsulated side effect)
+        behavior_handbook = self._persist_and_get_handbook(
+            current_behaviors, initial_question, initial_solution, new_question
+        )
 
         # STEP 4: Behave on a new question with the final handbook.
         with dspy.context(lm=self.behave_lm):
@@ -325,7 +533,7 @@ class MRP(dspy.Module):
                 question=new_question,
                 behaviors=behavior_handbook,
             )
-        behaved_solution = behave_prediction.solve_output
+        behaved_solution: SolveOutput = behave_prediction.solve_output
 
         return dspy.Prediction(
             initial_solution=initial_solution,
